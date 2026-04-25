@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-"""LOSO cross-validated RSSI baselines on Zenodo 15791300.
+"""Leakage-safe RSSI baselines for Zenodo 15791300.
 
 Run from repo root:
     /home/kpetrosyan/miniconda3/envs/c/bin/python experiments/baselines.py
 """
 from __future__ import annotations
 
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -27,341 +29,531 @@ from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from src.paths import REPO_ROOT, WIFI_H5, require_data
+from src.paths import REPO_ROOT, RSSI_CSV, WIFI_H5, require_data
 
 SEED = 0
 CELL_M = 0.5
+EXPECTED_GRID_SAMPLES = 20 * 53
+EXPECTED_RAW_SAMPLES = 1027
+FIRST_POINT_MISSING_SETUPS = {5, 7, 14}
+
 RUNS = REPO_ROOT / "runs"
-MODELS_DIR = REPO_ROOT / "models"
+MODELS = REPO_ROOT / "models"
 FIGS = REPO_ROOT / "figs"
 REPORT = REPO_ROOT / "report.md"
 
-NUM_COLS = ["ap_x_m", "ap_y_m", "mx_m", "my_m", "dist_m", "log_d", "same_room"]
+NUM_COLS = ["ap_x_m", "ap_y_m", "mx_m", "my_m", "log_distance_m", "same_room"]
 CAT_COLS = ["room_meas", "room_ap"]
+FEATURE_COLS = NUM_COLS + CAT_COLS
 
 
-def point_to_room(p: int) -> str:
-    return "office" if p <= 30 else "corridor" if p <= 45 else "elevator"
+def point_to_room(point: int) -> str:
+    if point <= 30:
+        return "office"
+    if point <= 45:
+        return "corridor"
+    return "elevator"
 
 
-def load_samples(h5_path: Path) -> pd.DataFrame:
-    with h5py.File(h5_path, "r") as f:
-        data, idx_all, ap_loc = f["data"][:], f["indices"][:], f["ap_locations"][:]
+def parse_rssi(value: str) -> float:
+    match = re.search(r"-?\d+", str(value))
+    if not match:
+        raise ValueError(f"could not parse RSSI value: {value!r}")
+    return float(match.group())
+
+
+def grid_coordinates(indices: np.ndarray, setup_idx: int, point: int) -> tuple[float, float]:
+    loc = np.argwhere(indices[setup_idx] == point)
+    if loc.shape != (1, 2):
+        raise ValueError(f"setup {setup_idx + 1}: point {point} has {len(loc)} grid locations")
+    row, col = loc[0]
+    return float(col * CELL_M), float(row * CELL_M)
+
+
+def observed_points_for_setup(setup: int, n_raw: int) -> list[int]:
+    first = 2 if setup in FIRST_POINT_MISSING_SETUPS else 1
+    points = list(range(first, first + n_raw))
+    if points[-1] > 53:
+        raise ValueError(f"setup {setup}: {n_raw} raw rows cannot map to points <= 53")
+    return points
+
+
+def load_samples() -> pd.DataFrame:
+    raw = pd.read_csv(RSSI_CSV)
+    raw["setup"] = raw["Setup"].astype(int)
+    raw["rssi"] = raw["Strength"].map(parse_rssi)
+
+    with h5py.File(WIFI_H5, "r") as f:
+        grid = f["data"][:]
+        indices = f["indices"][:]
+        ap_locations = f["ap_locations"][:].astype(int)
+
     rows = []
-    for s in range(20):
-        rssi, idx = data[s], idx_all[s]
-        ap_pt = int(ap_loc[s])
-        ap_y, ap_x = np.where(idx == ap_pt)
-        assert ap_y.size == 1, f"AP position ambiguous for setup {s + 1}"
-        apy, apx = int(ap_y[0]), int(ap_x[0])
-        ys, xs = np.nonzero(rssi)
-        for y, x in zip(ys, xs):
-            p = int(idx[y, x])
-            rows.append(dict(
-                setup=s + 1, point=p,
-                ap_x_m=apx * CELL_M, ap_y_m=apy * CELL_M,
-                mx_m=int(x) * CELL_M, my_m=int(y) * CELL_M,
-                room_meas=point_to_room(p), room_ap=point_to_room(ap_pt),
-                rssi=float(rssi[y, x]),
-            ))
+    for setup in sorted(raw["setup"].unique()):
+        setup_raw = raw.loc[raw["setup"] == setup].reset_index(drop=True)
+        ap_point = int(ap_locations[setup - 1])
+        ap_x_m, ap_y_m = grid_coordinates(indices, setup - 1, ap_point)
+        for source_row, point in enumerate(observed_points_for_setup(setup, len(setup_raw))):
+            mx_m, my_m = grid_coordinates(indices, setup - 1, point)
+            room_meas = point_to_room(point)
+            room_ap = point_to_room(ap_point)
+            rows.append(
+                {
+                    "sample_id": len(rows),
+                    "setup": setup,
+                    "source_row": int(setup_raw.index[source_row]),
+                    "point": point,
+                    "ap_point": ap_point,
+                    "ap_x_m": ap_x_m,
+                    "ap_y_m": ap_y_m,
+                    "mx_m": mx_m,
+                    "my_m": my_m,
+                    "room_meas": room_meas,
+                    "room_ap": room_ap,
+                    "same_room": int(room_meas == room_ap),
+                    "rssi": float(setup_raw.loc[source_row, "rssi"]),
+                }
+            )
+
     df = pd.DataFrame(rows)
-    df["dist_m"] = np.hypot(df.mx_m - df.ap_x_m, df.my_m - df.ap_y_m)
-    # Half-cell floor so log10(0) can't bite when measurement point == AP.
-    df["log_d"] = np.log10(df.dist_m.clip(lower=CELL_M / 2))
-    df["same_room"] = (df.room_meas == df.room_ap).astype(int)
+    df["distance_m"] = np.hypot(df["mx_m"] - df["ap_x_m"], df["my_m"] - df["ap_y_m"])
+    df["log_distance_m"] = np.log10(df["distance_m"].clip(lower=CELL_M / 2))
+    df["excluded_imputed_h5_targets"] = int(np.count_nonzero(grid) - len(df))
     return df
 
 
-def _pre() -> ColumnTransformer:
-    return ColumnTransformer([
-        ("num", StandardScaler(), NUM_COLS),
-        ("cat", OneHotEncoder(drop="first", sparse_output=False), CAT_COLS),
-    ])
+def preprocessor() -> ColumnTransformer:
+    return ColumnTransformer(
+        [
+            ("num", StandardScaler(), NUM_COLS),
+            ("cat", OneHotEncoder(drop="first", handle_unknown="ignore", sparse_output=False), CAT_COLS),
+        ]
+    )
 
 
 def build_models() -> dict[str, object]:
     return {
         "mean": DummyRegressor(strategy="mean"),
-        "logdistance": Pipeline([
-            ("pre", ColumnTransformer([("keep", "passthrough", ["log_d"])])),
-            ("lr", LinearRegression()),
-        ]),
-        "linear": Pipeline([("pre", _pre()), ("lr", LinearRegression())]),
-        "ridge": Pipeline([("pre", _pre()), ("ridge", Ridge(alpha=1.0))]),
-        "knn": Pipeline([("pre", _pre()), ("knn", KNeighborsRegressor(n_neighbors=5))]),
-        "rf": Pipeline([("pre", _pre()), ("rf", RandomForestRegressor(
-            n_estimators=200, max_depth=10, random_state=SEED, n_jobs=-1))]),
-        "gbr": Pipeline([("pre", _pre()), ("gbr", HistGradientBoostingRegressor(
-            random_state=SEED))]),
+        "logdistance": Pipeline(
+            [
+                ("features", ColumnTransformer([("log_distance", "passthrough", ["log_distance_m"])])),
+                ("model", LinearRegression()),
+            ]
+        ),
+        "ridge": Pipeline([("features", preprocessor()), ("model", Ridge(alpha=1.0))]),
+        "knn": Pipeline([("features", preprocessor()), ("model", KNeighborsRegressor(n_neighbors=5))]),
+        "rf": Pipeline(
+            [
+                ("features", preprocessor()),
+                (
+                    "model",
+                    RandomForestRegressor(
+                        n_estimators=300,
+                        max_depth=8,
+                        min_samples_leaf=2,
+                        random_state=SEED,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+        "hgb": Pipeline(
+            [
+                ("features", preprocessor()),
+                (
+                    "model",
+                    HistGradientBoostingRegressor(
+                        max_iter=120,
+                        learning_rate=0.05,
+                        l2_regularization=0.1,
+                        random_state=SEED,
+                    ),
+                ),
+            ]
+        ),
     }
 
 
-def run_cv(models, X, y, groups) -> tuple[pd.DataFrame, pd.DataFrame]:
-    logo = LeaveOneGroupOut()
-    metric_rows, pred_frames = [], []
-    for name, template in models.items():
-        for fold, (tr, va) in enumerate(logo.split(X, y, groups)):
-            m = clone(template)
-            m.fit(X.iloc[tr], y[tr])
-            holdout = int(groups[va][0])
-            for split, idx in [("train", tr), ("val", va)]:
-                yt, yh = y[idx], m.predict(X.iloc[idx])
-                err = yh - yt
-                metric_rows.append(dict(
-                    model=name, fold=fold, holdout_setup=holdout, split=split,
-                    n=len(idx),
-                    rmse=float(np.sqrt((err ** 2).mean())),
-                    mae=float(np.abs(err).mean()),
-                    r2=float(r2_score(yt, yh)) if np.var(yt) > 0 else np.nan,
-                ))
-            pred_frames.append(pd.DataFrame(dict(
-                model=name, fold=fold, holdout_setup=holdout,
-                sample_idx=va, y_true=y[va], y_hat=m.predict(X.iloc[va]),
-            )))
-        pooled = pd.concat(
-            [pf for pf in pred_frames if pf["model"].iloc[0] == name],
-            ignore_index=True,
+def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+
+
+def run_cv(models: dict[str, object], df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    x = df[FEATURE_COLS]
+    y = df["rssi"].to_numpy()
+    groups = df["ap_point"].to_numpy()
+    splitter = LeaveOneGroupOut()
+
+    folds = []
+    metrics = []
+    predictions = []
+    for fold, (train_idx, val_idx) in enumerate(splitter.split(x, y, groups)):
+        train_groups = set(groups[train_idx])
+        val_groups = set(groups[val_idx])
+        if train_groups & val_groups:
+            raise AssertionError(f"fold {fold}: AP group leaked into train and validation")
+        holdout_ap = int(groups[val_idx][0])
+        folds.append(
+            {
+                "fold": fold,
+                "holdout_ap_point": holdout_ap,
+                "train_n": int(len(train_idx)),
+                "val_n": int(len(val_idx)),
+                "holdout_setups": ",".join(map(str, sorted(df.iloc[val_idx]["setup"].unique()))),
+            }
         )
-        rmse = float(np.sqrt(((pooled.y_hat - pooled.y_true) ** 2).mean()))
-        print(f"  {name:<12s}  pooled val RMSE = {rmse:6.3f} dBm", flush=True)
-    return pd.DataFrame(metric_rows), pd.concat(pred_frames, ignore_index=True)
+        for name, template in models.items():
+            model = clone(template)
+            model.fit(x.iloc[train_idx], y[train_idx])
+            for split, idx in (("train", train_idx), ("val", val_idx)):
+                y_pred = model.predict(x.iloc[idx])
+                metrics.append(
+                    {
+                        "model": name,
+                        "fold": fold,
+                        "holdout_ap_point": holdout_ap,
+                        "split": split,
+                        "n": int(len(idx)),
+                        "rmse": rmse(y[idx], y_pred),
+                        "mae": float(np.mean(np.abs(y_pred - y[idx]))),
+                        "r2": float(r2_score(y[idx], y_pred)) if np.var(y[idx]) > 0 else np.nan,
+                    }
+                )
+            y_val_pred = model.predict(x.iloc[val_idx])
+            predictions.append(
+                pd.DataFrame(
+                    {
+                        "model": name,
+                        "fold": fold,
+                        "holdout_ap_point": holdout_ap,
+                        "sample_id": df.iloc[val_idx]["sample_id"].to_numpy(),
+                        "setup": df.iloc[val_idx]["setup"].to_numpy(),
+                        "point": df.iloc[val_idx]["point"].to_numpy(),
+                        "y_true": y[val_idx],
+                        "y_pred": y_val_pred,
+                        "error": y_val_pred - y[val_idx],
+                    }
+                )
+            )
+
+    return pd.DataFrame(folds), pd.DataFrame(metrics), pd.concat(predictions, ignore_index=True)
 
 
-def summarise(metrics: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
+def summarize(metrics: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    for name, g_val in metrics[metrics.split == "val"].groupby("model"):
-        g_tr = metrics[(metrics.model == name) & (metrics.split == "train")]
-        p = preds[preds.model == name]
-        err = (p.y_hat - p.y_true).to_numpy()
-        rows.append(dict(
-            model=name,
-            pooled_rmse=float(np.sqrt((err ** 2).mean())),
-            pooled_mae=float(np.abs(err).mean()),
-            mean_fold_rmse=float(g_val.rmse.mean()),
-            std_fold_rmse=float(g_val.rmse.std()),
-            mean_fold_r2=float(g_val.r2.mean()),
-            train_rmse=float(g_tr.rmse.mean()),
-        ))
-    return (pd.DataFrame(rows)
-            .sort_values("pooled_rmse").reset_index(drop=True))
+    for model, preds in predictions.groupby("model"):
+        val = metrics[(metrics["model"] == model) & (metrics["split"] == "val")]
+        train = metrics[(metrics["model"] == model) & (metrics["split"] == "train")]
+        rows.append(
+            {
+                "model": model,
+                "pooled_val_rmse": rmse(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy()),
+                "pooled_val_mae": float(np.mean(np.abs(preds["error"]))),
+                "mean_fold_val_rmse": float(val["rmse"].mean()),
+                "std_fold_val_rmse": float(val["rmse"].std()),
+                "mean_fold_val_r2": float(val["r2"].mean()),
+                "mean_train_rmse": float(train["rmse"].mean()),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("pooled_val_rmse").reset_index(drop=True)
 
 
-def sanity(df, metrics, preds, summary):
-    assert len(df) == 1060, f"expected 1060 samples, got {len(df)}"
-    assert (df.groupby("setup").size() == 53).all()
-    folds = metrics[["model", "fold", "holdout_setup"]].drop_duplicates()
-    per_model_folds = folds.groupby("model").fold.nunique()
-    assert (per_model_folds == 20).all()
-    assert folds.holdout_setup.nunique() == 20
-    for _, r in summary.iterrows():
-        p = preds[preds.model == r.model]
-        rederived = float(np.sqrt(((p.y_hat - p.y_true) ** 2).mean()))
-        assert abs(rederived - r.pooled_rmse) < 1e-9, r.model
-    mean_rmse = float(summary.set_index("model").loc["mean", "pooled_rmse"])
-    assert abs(mean_rmse - float(np.std(df.rssi))) < 2.0
+def validate_outputs(df: pd.DataFrame, folds: pd.DataFrame, metrics: pd.DataFrame, predictions: pd.DataFrame, summary: pd.DataFrame) -> None:
+    if len(df) != EXPECTED_RAW_SAMPLES:
+        raise AssertionError(f"expected {EXPECTED_RAW_SAMPLES} observed samples, got {len(df)}")
+    if int(df["excluded_imputed_h5_targets"].iloc[0]) != EXPECTED_GRID_SAMPLES - EXPECTED_RAW_SAMPLES:
+        raise AssertionError("unexpected imputed-target exclusion count")
+    if len(folds) != df["ap_point"].nunique() or len(folds) != 16:
+        raise AssertionError(f"expected 16 AP-location folds, got {len(folds)}")
+
+    expected_models = set(summary["model"])
+    for model in expected_models:
+        pred = predictions[predictions["model"] == model]
+        if pred["sample_id"].nunique() != len(df) or len(pred) != len(df):
+            raise AssertionError(f"{model}: expected one out-of-fold prediction per sample")
+        recomputed = rmse(pred["y_true"].to_numpy(), pred["y_pred"].to_numpy())
+        saved = float(summary.loc[summary["model"] == model, "pooled_val_rmse"].iloc[0])
+        if abs(recomputed - saved) > 1e-12:
+            raise AssertionError(f"{model}: summary RMSE does not match predictions")
+
+    fold_splits = metrics[["model", "fold", "split"]].drop_duplicates()
+    if (fold_splits.groupby(["model", "fold"]).size() != 2).any():
+        raise AssertionError("each model/fold must have train and val metrics")
 
 
-# ---------- plots ----------
 ROOM_COLORS = {"office": "C0", "corridor": "C1", "elevator": "C2"}
 
 
-def plot_target(df, path):
+def plot_target_distribution(df: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7, 4))
-    for r, c in ROOM_COLORS.items():
-        ax.hist(df.loc[df.room_meas == r, "rssi"], bins=30, alpha=0.55,
-                color=c, label=r)
-    ax.set_xlabel("RSSI [dBm]"); ax.set_ylabel("count"); ax.legend()
-    ax.set_title("RSSI distribution by measurement room")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    for room, color in ROOM_COLORS.items():
+        ax.hist(df.loc[df["room_meas"] == room, "rssi"], bins=28, alpha=0.55, color=color, label=room)
+    ax.set_xlabel("RSSI [dBm]")
+    ax.set_ylabel("observed samples")
+    ax.set_title("Observed RSSI targets by measurement room")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
-def plot_rssi_vs_logd(df, path):
+def plot_rssi_vs_distance(df: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(7, 5))
-    for r, c in ROOM_COLORS.items():
-        sub = df[df.room_meas == r]
-        ax.scatter(sub.log_d, sub.rssi, s=10, alpha=0.4, color=c, label=r)
-    A = np.column_stack([np.ones(len(df)), df.log_d])
-    (a, b), *_ = np.linalg.lstsq(A, df.rssi, rcond=None)
-    xs = np.linspace(df.log_d.min(), df.log_d.max(), 100)
-    ax.plot(xs, a + b * xs, "k--",
-            label=f"fit: RSSI = {a:.1f} + {b:.1f}·log10(d)")
-    ax.set_xlabel("log10(distance [m])"); ax.set_ylabel("RSSI [dBm]")
-    ax.legend(); ax.set_title("RSSI vs log-distance, all samples")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    for room, color in ROOM_COLORS.items():
+        sub = df[df["room_meas"] == room]
+        ax.scatter(sub["log_distance_m"], sub["rssi"], s=12, alpha=0.45, color=color, label=room)
+    fit = np.polyfit(df["log_distance_m"], df["rssi"], deg=1)
+    xs = np.linspace(df["log_distance_m"].min(), df["log_distance_m"].max(), 100)
+    ax.plot(xs, fit[0] * xs + fit[1], "k--", lw=1, label=f"fit: {fit[1]:.1f} + {fit[0]:.1f} log10(d)")
+    ax.set_xlabel("log10(distance [m])")
+    ax.set_ylabel("RSSI [dBm]")
+    ax.set_title("Observed RSSI vs AP distance")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
-def plot_cv_bars(summary, path):
-    s = summary.sort_values("pooled_rmse")
+def plot_cv_summary(summary: pd.DataFrame, path: Path) -> None:
+    s = summary.sort_values("pooled_val_rmse")
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.bar(s.model, s.pooled_rmse, yerr=s.std_fold_rmse, capsize=4,
-           color="C0", alpha=0.85)
-    for i, (v, sd) in enumerate(zip(s.pooled_rmse, s.std_fold_rmse)):
-        ax.text(i, v + 0.15, f"{v:.2f}", ha="center", fontsize=9)
-    ax.set_ylabel("pooled val RMSE [dBm]")
-    ax.set_title("LOSO-CV val RMSE  (error bars = std across 20 folds)")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    ax.bar(s["model"], s["pooled_val_rmse"], yerr=s["std_fold_val_rmse"], capsize=4, color="C0", alpha=0.85)
+    for i, value in enumerate(s["pooled_val_rmse"]):
+        ax.text(i, value + 0.12, f"{value:.2f}", ha="center", va="bottom", fontsize=9)
+    ax.set_ylabel("pooled validation RMSE [dBm]")
+    ax.set_title("Leave-one-AP-location-out validation RMSE")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
-def plot_pred_vs_true(preds, best, path):
-    p = preds[preds.model == best]
-    lo, hi = float(p.y_true.min()) - 2, float(p.y_true.max()) + 2
+def plot_train_val(summary: pd.DataFrame, path: Path) -> None:
+    s = summary.sort_values("pooled_val_rmse")
+    x = np.arange(len(s))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.bar(x - width / 2, s["mean_train_rmse"], width, label="train", color="C2", alpha=0.82)
+    ax.bar(x + width / 2, s["pooled_val_rmse"], width, label="validation", color="C0", alpha=0.82)
+    ax.set_xticks(x, s["model"])
+    ax.set_ylabel("RMSE [dBm]")
+    ax.set_title("Train vs out-of-fold validation error")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_predictions(predictions: pd.DataFrame, best_model: str, path: Path) -> None:
+    pred = predictions[predictions["model"] == best_model]
+    lo = float(min(pred["y_true"].min(), pred["y_pred"].min()) - 2)
+    hi = float(max(pred["y_true"].max(), pred["y_pred"].max()) + 2)
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot([lo, hi], [lo, hi], "k--", lw=0.8)
-    ax.scatter(p.y_true, p.y_hat, s=10, alpha=0.5)
-    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi); ax.set_aspect("equal")
-    ax.set_xlabel("true RSSI [dBm]"); ax.set_ylabel("predicted RSSI [dBm]")
-    ax.set_title(f"{best}: pooled val predictions (20 LOSO folds)")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    ax.scatter(pred["y_true"], pred["y_pred"], s=13, alpha=0.5)
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.set_xlabel("true RSSI [dBm]")
+    ax.set_ylabel("predicted RSSI [dBm]")
+    ax.set_title(f"{best_model}: pooled out-of-fold predictions")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
-def pick_median_fold(metrics, best):
-    val = metrics[(metrics.model == best) & (metrics.split == "val")].sort_values("rmse")
-    return int(val.iloc[len(val) // 2].holdout_setup)
+def plot_residual_map(df: pd.DataFrame, predictions: pd.DataFrame, summary: pd.DataFrame, path: Path) -> None:
+    best = str(summary.iloc[0]["model"])
+    val_metrics = predictions[predictions["model"] == best].copy()
+    fold_rmse = pd.Series(
+        {
+            fold: rmse(group["y_true"].to_numpy(), group["y_pred"].to_numpy())
+            for fold, group in val_metrics.groupby("fold")
+        }
+    )
+    fold = int(fold_rmse.sort_values().index[len(fold_rmse) // 2])
+    pred = val_metrics[val_metrics["fold"] == fold].sort_values("sample_id")
+    sub = df.set_index("sample_id").loc[pred["sample_id"]].copy()
+    sub["y_pred"] = pred["y_pred"].to_numpy()
+    sub["residual"] = sub["rssi"] - sub["y_pred"]
 
+    true_grid = np.full((28, 30), np.nan)
+    pred_grid = np.full((28, 30), np.nan)
+    resid_grid = np.full((28, 30), np.nan)
+    for row in sub.itertuples(index=False):
+        grid_row = int(row.my_m / CELL_M)
+        grid_col = int(row.mx_m / CELL_M)
+        true_grid[grid_row, grid_col] = row.rssi
+        pred_grid[grid_row, grid_col] = row.y_pred
+        resid_grid[grid_row, grid_col] = row.residual
 
-def plot_residual_map(df, preds, best, holdout_setup, path):
-    p = (preds[(preds.model == best) & (preds.holdout_setup == holdout_setup)]
-         .sort_values("sample_idx"))
-    sub = df.iloc[p.sample_idx.to_numpy()].copy()
-    sub["y_hat"] = p.y_hat.to_numpy()
-    sub["resid"] = sub.rssi - sub.y_hat
-    gt = np.full((28, 30), np.nan)
-    gp = np.full_like(gt, np.nan)
-    gr = np.full_like(gt, np.nan)
-    for _, row in sub.iterrows():
-        r, c = int(row.my_m / CELL_M), int(row.mx_m / CELL_M)
-        gt[r, c], gp[r, c], gr[r, c] = row.rssi, row.y_hat, row.resid
-    vabs = float(np.nanmax(np.abs(gr)))
+    vabs = float(np.nanmax(np.abs(resid_grid)))
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    for ax, g, title, cmap, kw in [
-        (axes[0], gt, "true RSSI", "viridis", {}),
-        (axes[1], gp, "predicted RSSI", "viridis", {}),
-        (axes[2], gr, "residual (true − pred)", "RdBu", {"vmin": -vabs, "vmax": vabs}),
-    ]:
-        im = ax.imshow(np.flipud(g), cmap=cmap, **kw)
-        fig.colorbar(im, ax=ax, shrink=0.7, label="dBm")
-        ax.set_title(title); ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"{best} — held-out setup {holdout_setup}")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    panels = [
+        (true_grid, "true RSSI", "viridis", {}),
+        (pred_grid, "predicted RSSI", "viridis", {}),
+        (resid_grid, "residual (true - pred)", "RdBu", {"vmin": -vabs, "vmax": vabs}),
+    ]
+    for ax, (grid, title, cmap, kwargs) in zip(axes, panels):
+        im = ax.imshow(np.flipud(grid), cmap=cmap, **kwargs)
+        fig.colorbar(im, ax=ax, shrink=0.72, label="dBm")
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    holdout = int(pred["holdout_ap_point"].iloc[0])
+    fig.suptitle(f"{best}: held-out AP point {holdout}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
-# ---------- report ----------
-def md_table(df):
-    cols = list(df.columns)
-    lines = ["| " + " | ".join(cols) + " |",
-             "|" + "|".join("---" for _ in cols) + "|"]
-    for _, r in df.iterrows():
-        cells = [f"{v:.3f}" if isinstance(v, float) else str(v) for v in r]
+def md_table(df: pd.DataFrame) -> str:
+    lines = ["| " + " | ".join(df.columns) + " |", "|" + "|".join("---" for _ in df.columns) + "|"]
+    for row in df.itertuples(index=False):
+        cells = [f"{value:.3f}" if isinstance(value, float) else str(value) for value in row]
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
-def write_report(df, summary, figs_used):
-    best = summary.iloc[0].model
-    best_rmse = summary.iloc[0].pooled_rmse
+def write_report(df: pd.DataFrame, folds: pd.DataFrame, summary: pd.DataFrame, figure_paths: dict[str, str]) -> None:
+    best = summary.iloc[0]
     table = md_table(summary)
-    txt = f"""# RSSI baselines on Zenodo 15791300
+    repeated_aps = (
+        df[["ap_point", "setup"]]
+        .drop_duplicates()
+        .groupby("ap_point")["setup"]
+        .apply(lambda s: ",".join(map(str, sorted(s))))
+    )
+    repeated_ap_text = "; ".join(
+        f"AP point {ap} in setups {setups}"
+        for ap, setups in repeated_aps[repeated_aps.str.contains(",")].to_dict().items()
+    )
+    text = f"""# Leakage-safe RSSI baselines
 
 Auto-generated by `experiments/baselines.py`.
 
-- **samples**: {len(df):,} (20 setups × 53 points)
-- **features**: `{', '.join(NUM_COLS + CAT_COLS)}`
-- **target**: RSSI in dBm, observed range {df.rssi.min():.0f} to {df.rssi.max():.0f}
-- **CV**: Leave-One-Setup-Out, k = 20; `StandardScaler` fit per fold
+- **target**: observed RSSI in dBm from `data/RSSI_raw_data.csv`
+- **samples**: {len(df):,} observed measurements
+- **excluded targets**: {int(df['excluded_imputed_h5_targets'].iloc[0])} H5-only imputed grid values
+- **features**: `{', '.join(FEATURE_COLS)}`
+- **CV**: leave-one-AP-location-out, k = {len(folds)}
+- **metric**: RMSE in dBm, computed as `sqrt(mean((prediction - target)^2))`
 - **seed**: {SEED}
 
-## Dataset
+## Dataset and leakage controls
 
-![RSSI distribution by measurement room]({figs_used['target']})
+The raw CSV has {len(df):,} observed RSSI readings. The processed H5 grid has
+{EXPECTED_GRID_SAMPLES:,} nonzero grid labels because the upstream toolbox fills
+missing measurements so every setup has 53 grid points. This benchmark excludes
+those {int(df['excluded_imputed_h5_targets'].iloc[0])} filled targets from
+training and validation RMSE.
 
-![RSSI vs log10(distance) with overall path-loss fit]({figs_used['logd']})
+The validation split groups by AP point, not setup. This matters because
+{repeated_ap_text} appear in multiple setups; holding out by AP point prevents
+the same AP location from appearing in both train and validation.
 
-## Cross-validated results
+All scaling and one-hot encoding live inside sklearn pipelines and are fit
+inside each fold on training rows only.
 
-Ranking metric is **pooled val RMSE** — sqrt(mean of squared errors over all
-1 060 val predictions concatenated across the 20 folds. `mean_fold_rmse ±
-std_fold_rmse` report the per-fold distribution (equal-weight average of the
-20 per-fold RMSEs). `train_rmse` is the average in-fold training RMSE and
-exposes under/overfitting.
+![Observed RSSI target distribution]({figure_paths['target']})
+
+![Observed RSSI vs log-distance]({figure_paths['distance']})
+
+## Cross-validation results
+
+The ranking metric is **pooled validation RMSE** across all out-of-fold
+predictions. Fold mean/std RMSE show the AP-location-to-AP-location variation.
+Mean train RMSE is included to expose overfitting.
 
 {table}
 
-![Pooled val RMSE per model]({figs_used['cv_bars']})
+Best model: **{best['model']}** with pooled validation RMSE
+**{best['pooled_val_rmse']:.2f} dBm**.
 
-Best model: **{best}** at pooled val RMSE **{best_rmse:.2f} dBm** over
-{len(df)} held-out predictions.
+![Validation RMSE by model]({figure_paths['cv']})
 
-![Predicted vs true, best model pooled across folds]({figs_used['pred']})
+![Train vs validation RMSE]({figure_paths['train_val']})
 
-![True / predicted / residual maps on one held-out setup]({figs_used['resid']})
+![Pooled out-of-fold predictions for the best model]({figure_paths['pred']})
 
-## Caveats
-
-- The 20 AP positions include 4 that appear in two setups each (the
-  'with-people' / 'no-people' pair design: setups 1↔13, 4↔14, 5↔16, 6↔15).
-  Those four held-out folds still have their AP anchor *location* present
-  in training (different occupancy). This is a property of the dataset,
-  not a bug in the split.
-- Coordinates are grid-based (0.5 m cells). The LiDAR point clouds are not
-  used here — an obvious next step is to add geometric features derived from
-  `registration_example.ply` (wall intersections, through-wall path count,
-  room volumes) to the same pipeline.
-- No hyperparameter search was done. The point of this run is a fair,
-  reproducible floor; tuning comes later.
+![Residual map on a representative held-out AP fold]({figure_paths['resid']})
 
 ## Artifacts
 
-- `runs/baselines_cv.csv`   — long-format per-fold metrics
-- `runs/baselines_summary.csv` — this table
-- `models/<name>.joblib`    — each baseline refit on all 1 060 samples
-- `figs/fig_*.png`          — the figures above
+- `runs/baselines_samples.csv` - observed sample table used by the experiment
+- `runs/baselines_folds.csv` - AP-location fold definitions
+- `runs/baselines_cv.csv` - train/validation metrics per model and fold
+- `runs/baselines_oof_predictions.csv` - out-of-fold predictions
+- `runs/baselines_summary.csv` - summary table above
+- `runs/baselines_config.json` - reproducibility metadata
+- `models/<model>.joblib` - each model refit on all observed samples
+- `figs/baseline_*.png` - report figures
 """
-    REPORT.write_text(txt)
+    REPORT.write_text(text)
 
 
-def main():
+def write_config(df: pd.DataFrame, folds: pd.DataFrame, models: dict[str, object]) -> None:
+    config = {
+        "seed": SEED,
+        "target": "observed raw RSSI dBm",
+        "sample_count": int(len(df)),
+        "excluded_imputed_h5_targets": int(df["excluded_imputed_h5_targets"].iloc[0]),
+        "cv": "LeaveOneGroupOut grouped by AP point",
+        "fold_count": int(len(folds)),
+        "feature_columns": FEATURE_COLS,
+        "models": list(models),
+    }
+    (RUNS / "baselines_config.json").write_text(json.dumps(config, indent=2) + "\n")
+
+
+def save_refit_models(models: dict[str, object], df: pd.DataFrame) -> None:
+    x = df[FEATURE_COLS]
+    y = df["rssi"].to_numpy()
+    for name, template in models.items():
+        model = clone(template)
+        model.fit(x, y)
+        joblib.dump(model, MODELS / f"{name}.joblib")
+
+
+def main() -> int:
     require_data()
     np.random.seed(SEED)
-    for d in (RUNS, MODELS_DIR, FIGS):
-        d.mkdir(parents=True, exist_ok=True)
+    for path in (RUNS, MODELS, FIGS):
+        path.mkdir(parents=True, exist_ok=True)
 
-    df = load_samples(WIFI_H5)
-    X = df[NUM_COLS + CAT_COLS]
-    y = df["rssi"].to_numpy()
-    groups = df["setup"].to_numpy()
-
+    df = load_samples()
     models = build_models()
-    print(f"running LOSO-CV (k=20) over {len(models)} baselines on {len(df)} samples:")
-    metrics, preds = run_cv(models, X, y, groups)
-    summary = summarise(metrics, preds)
-    sanity(df, metrics, preds, summary)
+    folds, metrics, predictions = run_cv(models, df)
+    summary = summarize(metrics, predictions)
+    validate_outputs(df, folds, metrics, predictions, summary)
 
+    df.to_csv(RUNS / "baselines_samples.csv", index=False)
+    folds.to_csv(RUNS / "baselines_folds.csv", index=False)
     metrics.to_csv(RUNS / "baselines_cv.csv", index=False)
+    predictions.to_csv(RUNS / "baselines_oof_predictions.csv", index=False)
     summary.to_csv(RUNS / "baselines_summary.csv", index=False)
+    write_config(df, folds, models)
+    save_refit_models(models, df)
 
-    best = summary.iloc[0].model
-    holdout = pick_median_fold(metrics, best)
-    figs_used = {
-        "target": "figs/fig_target_hist.png",
-        "logd": "figs/fig_rssi_vs_logd.png",
-        "cv_bars": "figs/fig_cv_rmse_bars.png",
-        "pred": "figs/fig_pred_vs_true.png",
-        "resid": "figs/fig_residual_map.png",
+    figures = {
+        "target": "figs/baseline_target_distribution.png",
+        "distance": "figs/baseline_rssi_vs_distance.png",
+        "cv": "figs/baseline_cv_rmse.png",
+        "train_val": "figs/baseline_train_vs_val_rmse.png",
+        "pred": "figs/baseline_pred_vs_true.png",
+        "resid": "figs/baseline_residual_map.png",
     }
-    plot_target(df, FIGS / "fig_target_hist.png")
-    plot_rssi_vs_logd(df, FIGS / "fig_rssi_vs_logd.png")
-    plot_cv_bars(summary, FIGS / "fig_cv_rmse_bars.png")
-    plot_pred_vs_true(preds, best, FIGS / "fig_pred_vs_true.png")
-    plot_residual_map(df, preds, best, holdout, FIGS / "fig_residual_map.png")
+    plot_target_distribution(df, REPO_ROOT / figures["target"])
+    plot_rssi_vs_distance(df, REPO_ROOT / figures["distance"])
+    plot_cv_summary(summary, REPO_ROOT / figures["cv"])
+    plot_train_val(summary, REPO_ROOT / figures["train_val"])
+    plot_predictions(predictions, str(summary.iloc[0]["model"]), REPO_ROOT / figures["pred"])
+    plot_residual_map(df, predictions, summary, REPO_ROOT / figures["resid"])
+    write_report(df, folds, summary, figures)
 
-    for name, template in models.items():
-        m = clone(template); m.fit(X, y)
-        joblib.dump(m, MODELS_DIR / f"{name}.joblib")
-
-    write_report(df, summary, figs_used)
-    print(f"\nbest: {best}  (pooled val RMSE {summary.iloc[0].pooled_rmse:.3f} dBm)")
-    print(f"wrote {REPORT.relative_to(REPO_ROOT)}, runs/, models/, figs/")
+    print(summary.to_string(index=False, float_format=lambda value: f"{value:.3f}"))
+    print(f"\nwrote {REPORT.relative_to(REPO_ROOT)}, runs/, models/, figs/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

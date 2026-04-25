@@ -3,3 +3,9 @@ pandas
 h5py
 matplotlib
 open3d
+scikit-learn
+joblib
+torch
+torchvision
+segmentation-models-pytorch
+pytest
