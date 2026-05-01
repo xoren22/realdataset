@@ -1,35 +1,20 @@
 # realdataset
 
-Investigating Zenodo record [15791300](https://zenodo.org/records/15791300)
-— *A Multimodal Dataset with 3D Point Cloud and RSSI Measurement* — and
-building models on it to see how learnable the Wi-Fi RSSI field is given
-the indoor geometry.
+Minimal fixed-alpha ridge comparison for the Zenodo 15791300 indoor RSSI data.
 
-See [`CLAUDE.md`](CLAUDE.md) for a full description of the dataset and
-repo conventions.
-
-## Setup
+The repo now has one runnable experiment script:
 
 ```bash
-# 1. install deps (numpy, pandas, h5py, matplotlib, open3d)
-pip install -r requirements.txt
-
-# 2. fetch the dataset (~10 MB zip from Zenodo, md5-checked, unpacked into ./data/)
-python scripts/init_data.py
-
-# 3. sanity-check: regenerate the overview figures into ./figs/
-python experiments/visualize.py
+/home/kpetrosyan/miniconda3/envs/c/bin/python experiments/comparing_feature_sets_ridge.py
 ```
 
-`scripts/init_data.py` is idempotent — re-running it is a no-op once
-`./data/` contains all five expected files.
+It refits AP-held-out ridge regressions over 10 random support draws and
+compares only:
 
-## Layout
+- `sparse12_ridge`: 12 sparse/geometry features.
+- `sparse12_plus_r101_pl_ridge`: those 12 features plus `r101_pl_pred`.
 
-```
-src/           importable library (paths, RSSI grid parsing, point-cloud helpers)
-scripts/       one-shot commands (data bootstrap, ...)
-experiments/   analysis + modelling scripts
-data/          raw dataset (gitignored, populated by init_data.py)
-figs/          generated figures (gitignored)
-```
+Ridge alpha is fixed at `0.1`; there is no alpha grid search.
+
+Historical result summaries were concatenated verbatim into
+`results_summaries.md`.
