@@ -125,6 +125,45 @@ over the no-sparse RF baseline by about 0.50 dBm and over sparse RF by about
 correlation and feature-importance analysis: r101 adds a smooth correction, but
 much of its signal overlaps with distance and sparse-support interpolation.
 
+### One-feature r101 decoded-map calibration
+
+A later random-support check fit ridge models using only the decoded
+`r101_pl_pred` scalar:
+
+`RSSI_hat = a * r101_pl_pred + b`
+
+Across 10 random support draws and the same AP-held-out folds, the best alpha
+was about `10`, though alphas from `0.01` to `10` were almost identical. The
+average raw-space fit was:
+
+`RSSI_hat = -0.323 * r101_pl_pred - 21.28`
+
+with validation RMSE `7.167 ± 0.271` dBm over random support draws. This is
+worse than the fixed-support `r101_pl_train_cal` row above because the newer
+number averages over random sparse support choices and uses only one scalar
+feature. It is still useful diagnostically: when sparse features are absent,
+the model leans heavily on `r101_pl_pred`; when sparse features are present, the
+raw coefficient on `r101_pl_pred` shrinks to about `-0.10` because sparse
+distance/support features explain much of the same large-scale pathloss trend.
+
+### Paired significance of adding `r101_pl_pred`
+
+A later feature-set comparison repeated the sparse random-support protocol over
+10 independent support draws and compared the 12 non-constant sparse engineered
+features against those same 12 features plus `r101_pl_pred`. The comparison is
+paired by support draw, so it directly measures whether the 13th feature gives
+a consistent gain rather than just comparing overlapping error bars.
+
+| model family | comparison | mean RMSE gain | std of paired gain | paired t-test p-value |
+|---|---|---:|---:|---:|
+| tuned SVM-style linear regressor | `sparse12` -> `sparse12 + r101_pl_pred` | 0.506 | 0.152 | 2.3e-6 |
+| tuned ridge | `sparse12` -> `sparse12 + r101_pl_pred` | 0.439 | 0.119 | 9.7e-7 |
+
+For the tuned SVM-style comparison, all 10 support draws improved when adding
+`r101_pl_pred`. This makes the decoded r101 prediction's contribution
+statistically clear under random sparse sampling, even though the absolute gain
+is modest at roughly half a dB.
+
 ## Ridge Alpha Choice
 
 We initially swept ridge alphas with AP-grouped inner CV. That showed small
